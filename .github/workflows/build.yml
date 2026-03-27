@@ -9,7 +9,7 @@ on:
       openssl_version:
         description: "OpenSSL version to use"
         required: true
-        default: "3.4.1"
+        default: "3.6.1"
 
   schedule:
     # Check for new SQLCipher releases every Monday at 06:00 UTC.
