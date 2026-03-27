@@ -1,0 +1,240 @@
+name: Build SQLCipher
+
+on:
+  workflow_dispatch:
+    inputs:
+      sqlcipher_version:
+        description: "SQLCipher version to build (e.g. 4.14.0)"
+        required: true
+      openssl_version:
+        description: "OpenSSL version to use"
+        required: true
+        default: "3.4.1"
+
+  schedule:
+    # Check for new SQLCipher releases every Monday at 06:00 UTC.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: write
+
+env:
+  NDK_VERSION: "28.2.13676358"
+  MIN_API: "26"
+  IOS_MIN_VERSION: "15.6"
+
+jobs:
+  # ===========================================================================
+  # Determine which version to build. For workflow_dispatch the user provides
+  # the version explicitly. For scheduled runs we compare the latest SQLCipher
+  # release against our latest release and only proceed if there is a new one.
+  # ===========================================================================
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      sqlcipher_version: ${{ steps.check.outputs.sqlcipher_version }}
+      openssl_version: ${{ steps.check.outputs.openssl_version }}
+    steps:
+      - name: Determine version to build
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "sqlcipher_version=${{ inputs.sqlcipher_version }}" >> "$GITHUB_OUTPUT"
+            echo "openssl_version=${{ inputs.openssl_version }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Scheduled run — check for a new upstream release.
+          LATEST_UPSTREAM="$(gh api repos/sqlcipher/sqlcipher/releases/latest \
+            --jq '.tag_name' | sed 's/^v//')"
+          echo "Latest upstream SQLCipher: ${LATEST_UPSTREAM}"
+
+          OUR_LATEST="$(gh api repos/${{ github.repository }}/releases/latest \
+            --jq '.tag_name' 2>/dev/null | sed 's/^v//' || echo "")"
+          echo "Our latest release: ${OUR_LATEST:-none}"
+
+          if [ -z "${OUR_LATEST}" ] || [ "${LATEST_UPSTREAM}" != "${OUR_LATEST}" ]; then
+            echo "New version detected, will build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "sqlcipher_version=${LATEST_UPSTREAM}" >> "$GITHUB_OUTPUT"
+            echo "openssl_version=3.4.1" >> "$GITHUB_OUTPUT"
+          else
+            echo "Already up to date."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ===========================================================================
+  # Android — one job per ABI, all run in parallel.
+  # Produces: out/android/<abi>/{lib,include}/
+  # ===========================================================================
+  build-android:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64]
+    env:
+      SQLCIPHER_VERSION: ${{ needs.check-release.outputs.sqlcipher_version }}
+      OPENSSL_VERSION: ${{ needs.check-release.outputs.openssl_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NDK
+        run: |
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "ndk;${NDK_VERSION}" > /dev/null
+
+      - name: Cache source downloads
+        uses: actions/cache@v4
+        with:
+          path: .build-src
+          key: src-openssl-${{ env.OPENSSL_VERSION }}-sqlcipher-${{ env.SQLCIPHER_VERSION }}
+
+      - name: Build OpenSSL + SQLCipher
+        run: |
+          chmod +x scripts/build-android-abi.sh
+          ./scripts/build-android-abi.sh ${{ matrix.abi }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ matrix.abi }}
+          path: out/android/${{ matrix.abi }}/
+
+  # ===========================================================================
+  # iOS — one job per target (device arm64, simulator arm64, simulator x86_64).
+  # Produces: out/ios/<target>/{lib,include}/
+  # ===========================================================================
+  build-ios:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [device-arm64, simulator-arm64, simulator-x86_64]
+    env:
+      SQLCIPHER_VERSION: ${{ needs.check-release.outputs.sqlcipher_version }}
+      OPENSSL_VERSION: ${{ needs.check-release.outputs.openssl_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache source downloads
+        uses: actions/cache@v4
+        with:
+          path: .build-src
+          key: src-openssl-${{ env.OPENSSL_VERSION }}-sqlcipher-${{ env.SQLCIPHER_VERSION }}
+
+      - name: Build OpenSSL + SQLCipher
+        run: |
+          chmod +x scripts/build-ios-target.sh
+          ./scripts/build-ios-target.sh ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-${{ matrix.target }}
+          path: out/ios/${{ matrix.target }}/
+
+  # ===========================================================================
+  # Package all artifacts and create a GitHub release.
+  # ===========================================================================
+  release:
+    needs: [check-release, build-android, build-ios]
+    runs-on: ubuntu-latest
+    env:
+      SQLCIPHER_VERSION: ${{ needs.check-release.outputs.sqlcipher_version }}
+      OPENSSL_VERSION: ${{ needs.check-release.outputs.openssl_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Package Android archive
+        run: |
+          mkdir -p release/android
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            mkdir -p "release/android/${abi}"
+            cp -r "artifacts/android-${abi}/lib" "release/android/${abi}/"
+          done
+          # Headers are identical across ABIs — include once at the top level.
+          cp -r "artifacts/android-arm64-v8a/include" "release/android/"
+
+          cd release
+          tar czf "sqlcipher-${SQLCIPHER_VERSION}-android.tar.gz" android/
+          cd ..
+
+      - name: Package iOS archive
+        run: |
+          mkdir -p release/ios
+          for target in device-arm64 simulator-arm64 simulator-x86_64; do
+            mkdir -p "release/ios/${target}"
+            cp -r "artifacts/ios-${target}/lib" "release/ios/${target}/"
+          done
+          # Headers are identical across targets — include once at the top level.
+          cp -r "artifacts/ios-device-arm64/include" "release/ios/"
+
+          cd release
+          tar czf "sqlcipher-${SQLCIPHER_VERSION}-ios.tar.gz" ios/
+          cd ..
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${SQLCIPHER_VERSION}"
+
+          BODY="$(cat <<EOF
+          Prebuilt SQLCipher **${SQLCIPHER_VERSION}** static libraries with OpenSSL **${OPENSSL_VERSION}**.
+
+          ## Android
+
+          Static libraries for linking into gomobile via \`CGO_CFLAGS\` / \`CGO_LDFLAGS\`:
+
+          | ABI | Libraries |
+          |-----|-----------|
+          | arm64-v8a | \`libsqlcipher.a\`, \`libcrypto.a\`, \`libssl.a\` |
+          | armeabi-v7a | \`libsqlcipher.a\`, \`libcrypto.a\`, \`libssl.a\` |
+          | x86_64 | \`libsqlcipher.a\`, \`libcrypto.a\`, \`libssl.a\` |
+
+          Min API: ${MIN_API} · NDK: ${NDK_VERSION}
+
+          ## iOS
+
+          Static libraries for each target:
+
+          | Target | Description |
+          |--------|-------------|
+          | device-arm64 | Physical iOS devices |
+          | simulator-arm64 | Simulator on Apple Silicon |
+          | simulator-x86_64 | Simulator on Intel |
+
+          Min iOS version: ${IOS_MIN_VERSION}
+
+          ## Compile flags
+
+          SQLCipher was built with:
+          \`\`\`
+          -DSQLITE_HAS_CODEC
+          -DSQLCIPHER_CRYPTO_OPENSSL
+          -DSQLITE_TEMP_STORE=2
+          -DSQLITE_EXTRA_INIT=sqlcipher_extra_init
+          -DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown
+          \`\`\`
+          EOF
+          )"
+
+          gh release create "${TAG}" \
+            --title "SQLCipher ${SQLCIPHER_VERSION}" \
+            --notes "${BODY}" \
+            release/sqlcipher-${SQLCIPHER_VERSION}-android.tar.gz \
+            release/sqlcipher-${SQLCIPHER_VERSION}-ios.tar.gz
