@@ -79,6 +79,7 @@ fi
 # --- Build OpenSSL ---
 echo "==> Building OpenSSL ${OPENSSL_VERSION} for ${ABI}..."
 
+mkdir -p "${BUILD_DIR}"
 rm -rf "${BUILD_DIR}/openssl"
 cp -a "${SRC_DIR}/openssl-${OPENSSL_VERSION}" "${BUILD_DIR}/openssl"
 cd "${BUILD_DIR}/openssl"
