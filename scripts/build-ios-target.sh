@@ -85,11 +85,11 @@ rm -rf "${BUILD_DIR}/openssl"
 cp -a "${SRC_DIR}/openssl-${OPENSSL_VERSION}" "${BUILD_DIR}/openssl"
 cd "${BUILD_DIR}/openssl"
 
+CFLAGS="-arch ${ARCH} ${MIN_VERSION_FLAG}" \
+LDFLAGS="-arch ${ARCH} ${MIN_VERSION_FLAG}" \
 ./Configure "${OPENSSL_TARGET}" \
-  -arch "${ARCH}" \
   --prefix="${OUT_DIR}" \
   no-shared no-tests no-ui-console no-engine no-async \
-  "${MIN_VERSION_FLAG}" \
   2>&1 | tail -3
 
 make -j"${JOBS}" build_libs 2>&1 | tail -3
